@@ -1,7 +1,7 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
 import React, { useMemo, useRef, useState } from 'react';
-import { Alert, FlatList, Keyboard, Modal, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, FlatList, Keyboard, Modal, StyleSheet, Text, TextInput, TouchableOpacity, View, ViewStyle } from 'react-native';
 import { Calendar, LocaleConfig } from 'react-native-calendars';
 import MapView, { Marker } from 'react-native-maps';
 
@@ -19,11 +19,30 @@ LocaleConfig.locales['fr'] = {
 };
 LocaleConfig.defaultLocale = 'fr';
 
+interface Pin {
+  id: string;
+  coordinate: {
+    latitude: number;
+    longitude: number;
+  };
+  title: string;
+  description: string;
+  rating: number;
+  dateISO: string;
+  dateReadable: string;
+  partners: string[]; 
+}
+
+interface AppStyles {
+  sectionTitle: ViewStyle; // 🔑 AJOUT EXPLICITE DU STYLE ICI
+  [key: string]: any; // Permet aux autres styles (container, map, etc.) d'être reconnus
+}
+
 export default function App() {
   const [currentTab, setCurrentTab] = useState('map'); 
   
   // --- DONNÉES LOCALES (Tableau simple) ---
-  const [pins, setPins] = useState<any[]>([]);
+  const [pins, setPins] = useState<Pin[]>([]);
 
   // --- CARTE & NAVIGATION ---
   const [region, setRegion] = useState({ latitude: 48.8566, longitude: 2.3522, latitudeDelta: 0.0922, longitudeDelta: 0.0421 });
@@ -41,9 +60,15 @@ export default function App() {
   const [showDatePicker, setShowDatePicker] = useState(false);
 
   // --- CONSULTATION ---
-  const [selectedPin, setSelectedPin] = useState<any>(null);
+  const [selectedPin, setSelectedPin] = useState<Pin | null>(null);
   const [calendarVisible, setCalendarVisible] = useState(false);
-
+  const [pinsDuJour, setPinsDuJour] = useState<Pin[]>([]);
+  const [pinsDuJourModalVisible, setPinsDuJourModalVisible] = useState(false);
+  
+  // 🔑 MODIFICATION DES ÉTATS PARTENAIRES :
+  const [partnersList, setPartnersList] = useState<string[]>(['Solo']); // Liste de tous les partenaires uniques
+  const [currentPartners, setCurrentPartners] = useState<string[]>(['Solo']); // Doit être un tableau pour le pin en cours
+ 
   // --- FONCTIONS ---
 
   const handleSearchAddress = async () => {
@@ -64,19 +89,34 @@ export default function App() {
 
   const markedDates = useMemo(() => {
     let marks: any = {};
-    pins.forEach(pin => {
-      if(pin.dateISO) marks[pin.dateISO] = { marked: true, dotColor: 'tomato' };
+
+    const allPins = pins || []
+
+    allPins.forEach(pin => {
+      if(pin.dateISO) {
+        const dateString = pin.dateISO;
+        if (!marks[dateString]) {
+          marks[dateString] = { dots: [] };
+        }
+        marks[dateString].dots.push({key: pin.id,color: 'tomato'});
+      }
     });
     return marks;
   }, [pins]);
 
   const onDayPress = (day: any) => {
-    const foundPin = pins.find(p => p.dateISO === day.dateString);
-    if (foundPin) {
+    const foundPins = pins.filter(p => p.dateISO === day.dateString);
+    if (foundPins.length === 1) {
       setCalendarVisible(false);
-      setTimeout(() => setSelectedPin(foundPin), 500);
+      setTimeout(() => setSelectedPin(foundPins[0]), 500);
+    
+    } else if (foundPins.length > 1) {
+
+      setCalendarVisible(false);
+      setTimeout(() => setPinsDuJour(foundPins), 500);
     }
   };
+
 
   const startAddingPin = () => { setIsSelecting(true); setSearchAddress(''); setSelectedPin(null); };
 
@@ -84,6 +124,7 @@ export default function App() {
     setTempCoordinate({ latitude: region.latitude, longitude: region.longitude });
     setIsSelecting(false);
     setTitle(''); setDescription(''); setRating(0); setDate(new Date());
+    setCurrentPartners(['Solo']);
     setModalVisible(true);
   };
 
@@ -92,6 +133,13 @@ export default function App() {
     if (!title) return;
     
     const isoDate = date.toISOString().split('T')[0];
+
+    // 1. Mettre à jour la liste des partenaires uniques (partnersList)
+    currentPartners.forEach(partner => {
+        if (partner && partner !== 'Solo' && !partnersList.includes(partner)) {
+            setPartnersList(prevList => [...prevList, partner]);
+        }
+    });
     
     const newPin = {
       id: Date.now().toString(), // ID simple basé sur l'heure
@@ -101,10 +149,12 @@ export default function App() {
       rating: rating,
       dateISO: isoDate,
       dateReadable: date.toLocaleDateString(),
+      partners: currentPartners
     };
 
-    setPins([...pins, newPin]); // On ajoute au tableau local
+    setPins([...(pins || []), newPin]); // On ajoute au tableau local
     setModalVisible(false);
+    setCurrentPartners(['Solo']);
   };
 
   // --- RENDER ---
@@ -147,10 +197,10 @@ export default function App() {
   const renderHistoryScreen = () => (
     <View style={styles.historyContainer}>
       <Text style={styles.pageTitle}>Mon Historique 📜</Text>
-      <FlatList
+      <FlatList<Pin>
           data={pins}
           keyExtractor={(item) => item.id}
-          renderItem={({ item }) => (
+          renderItem={({ item }: { item: Pin}) => (
             <TouchableOpacity style={styles.historyCard} onPress={() => setSelectedPin(item)}>
               <View style={styles.historyHeader}>
                 <Text style={styles.historyTitle}>{item.title}</Text>
@@ -179,17 +229,53 @@ export default function App() {
         ))}
       </View>
 
-      <Modal visible={calendarVisible} animationType="slide" transparent={true}>
+      <Modal visible={calendarVisible} animationType="slide" transparent={false}>
         <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
                 <Text style={styles.modalTitle}>Mon Calendrier 📅</Text>
-                <Calendar markedDates={markedDates} onDayPress={onDayPress} theme={{ todayTextColor: '#2196F3', arrowColor: '#2196F3', dotColor: 'tomato', selectedDotColor: 'tomato' }} />
+                <Calendar 
+                markingType = 'multi-dot' 
+                markedDates={markedDates} 
+                onDayPress={onDayPress} 
+                theme={{ todayTextColor: '#2196F3', arrowColor: '#2196F3'}} />
                 <TouchableOpacity onPress={() => setCalendarVisible(false)} style={[styles.button, styles.closeButton, {marginTop: 20}]}><Text style={styles.buttonText}>Fermer</Text></TouchableOpacity>
             </View>
         </View>
       </Modal>
 
-      <AddPinModal 
+      <Modal visible={pinsDuJour.length > 0} animationType="fade" transparent={true}>
+          <View style={styles.modalOverlay}>
+              <View style={styles.modalContent}>
+                  <Text style={styles.modalTitle}>Pins du jour ({pinsDuJour.length})</Text>
+                  <FlatList
+                      data={pinsDuJour}
+                      keyExtractor={(item) => item.id}
+                      style={{ flex: 1, marginBottom: 15 }}
+                      renderItem={({ item }) => (
+                          <TouchableOpacity 
+                              style={styles.historyCard} 
+                              onPress={() => {
+                                  setPinsDuJour([]); // Ferme la liste
+                                  setSelectedPin(item); // Affiche le pin sélectionné
+                              }}
+                          >
+                              <View style={styles.historyHeader}>
+                                  <Text style={styles.historyTitle}>{item.title}</Text>
+                                  <Text style={styles.historyDate}>{item.dateReadable}</Text>
+                              </View>
+                              <StarRating rating={item.rating} isInteractive={false} />
+                          </TouchableOpacity>
+                      )}
+                  />
+                  <TouchableOpacity 
+                      onPress={() => setPinsDuJour([])} 
+                      style={[styles.button, styles.closeButton, {marginTop: 20}]}
+                  >
+                      <Text style={styles.buttonText}>Fermer</Text>
+                  </TouchableOpacity>
+              </View>
+          </View>
+      </Modal><AddPinModal 
         visible={modalVisible}
         onClose={() => setModalVisible(false)}
         onSave={savePin}
@@ -198,6 +284,9 @@ export default function App() {
         rating={rating} setRating={setRating}
         date={date} setDate={setDate}
         showDatePicker={showDatePicker} setShowDatePicker={setShowDatePicker}
+        partnersList={partnersList}
+        currentPartners={currentPartners}
+        setCurrentPartners={setCurrentPartners}
       />
 
       <Modal visible={selectedPin !== null} animationType="fade" transparent={true}>
@@ -210,6 +299,13 @@ export default function App() {
                 </View>
                 <Text style={styles.modalTitle}>{selectedPin.title}</Text>
                 <Text style={styles.dateBadge}>{selectedPin.dateReadable}</Text>
+                <Text style={styles.sectionTitle}>
+                    Partenaire(s) :
+                    <Text style={{fontWeight: 'normal', color: '#555', marginLeft: 5}}>
+                        {(selectedPin.partners || ['Solo']).join(', ')}
+                    </Text>
+                </Text>
+
                 <View style={{marginVertical: 10}}>
                     <StarRating rating={selectedPin.rating} isInteractive={false} />
                 </View>
@@ -249,14 +345,15 @@ const styles = StyleSheet.create({
   historyTitle: { fontSize: 18, fontWeight: 'bold', color: '#333' },
   historyDate: { fontSize: 12, color: '#888' },
   fab: { position: 'absolute', bottom: 20, right: 20, width: 60, height: 60, borderRadius: 30, backgroundColor: '#2196F3', justifyContent: 'center', alignItems: 'center', elevation: 5 },
-  modalOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)' },
-  modalContent: { width: '85%', backgroundColor: 'white', padding: 20, borderRadius: 20, elevation: 5 },
+  modalOverlay: { flex: 1, justifyContent: 'flex-start', alignItems: 'stretch', backgroundColor: 'rgba(0,0,0,0.5)', paddingTop: 50 },
+  modalContent: { flex: 1, width: '100%', backgroundColor: 'white', padding: 20, borderRadius: 0, elevation: 5 },
   modalTitle: { fontSize: 22, fontWeight: 'bold', marginBottom: 15, color: '#333', textAlign:'center' },
   miniMapContainer: { height: 150, borderRadius: 15, overflow: 'hidden', marginBottom: 15, width: '100%' },
   miniMap: { width: '100%', height: '100%' },
   dateBadge: { alignSelf:'flex-start', fontSize: 12, color: 'white', backgroundColor: '#2196F3', paddingVertical: 4, paddingHorizontal: 8, borderRadius: 10, overflow: 'hidden', marginBottom: 5 },
   descriptionText: { fontSize: 16, color: '#555', marginBottom: 20, fontStyle: 'italic' },
+  sectionTitle: { fontSize: 16, fontWeight: 'bold', color: '#333', marginTop: 10, marginBottom: 5,},
   button: { padding: 12, borderRadius: 10, minWidth: 100, alignItems: 'center' },
   closeButton: { backgroundColor: '#2196F3', width: '100%' },
-  buttonText: { color: 'white', fontWeight: 'bold' }
+  buttonText: { color: 'white', fontWeight: 'bold' },
 });
