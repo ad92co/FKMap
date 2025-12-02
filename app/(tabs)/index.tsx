@@ -1,12 +1,19 @@
 import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
-import React, { useMemo, useRef, useState } from 'react';
-import { Alert, FlatList, Keyboard, Modal, StyleSheet, Text, TextInput, TouchableOpacity, View, ViewStyle } from 'react-native';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, FlatList, Keyboard, Modal, StyleSheet, Text, TextInput, TouchableOpacity, View, ViewStyle } from 'react-native';
 import { Calendar, LocaleConfig } from 'react-native-calendars';
 import MapView, { Marker } from 'react-native-maps';
 
+// --- IMPORTS FIREBASE ---
+import { onAuthStateChanged, signOut } from 'firebase/auth';
+import { addDoc, collection, onSnapshot, orderBy, query } from 'firebase/firestore';
+// Assurez-vous que ce chemin est correct (si firebaseConfig est à la racine, c'est ../../)
+import { auth, db } from '../../firebaseConfig';
+
 // --- NOS COMPOSANTS ---
 import AddPinModal from '../../components/AddPinModal';
+import AuthScreen from '../../components/AuthScreen';
 import StarRating from '../../components/StarRating';
 
 // Config Calendrier FR
@@ -21,28 +28,35 @@ LocaleConfig.defaultLocale = 'fr';
 
 interface Pin {
   id: string;
-  coordinate: {
-    latitude: number;
-    longitude: number;
-  };
+  coordinate: { latitude: number; longitude: number; };
   title: string;
   description: string;
   rating: number;
   dateISO: string;
   dateReadable: string;
   partners: string[]; 
+  userEmail?: string;
 }
 
 interface AppStyles {
-  sectionTitle: ViewStyle; // 🔑 AJOUT EXPLICITE DU STYLE ICI
-  [key: string]: any; // Permet aux autres styles (container, map, etc.) d'être reconnus
+  sectionTitle: ViewStyle;
+  [key: string]: any;
 }
 
 export default function App() {
+  // =========================================================
+  // 1. DÉCLARATION DES HOOKS (ETAT)
+  // =========================================================
+
+  // --- AUTHENTIFICATION (Firebase) ---
+  const [user, setUser] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   const [currentTab, setCurrentTab] = useState('map'); 
   
-  // --- DONNÉES LOCALES (Tableau simple) ---
+  // --- DONNÉES PINS (Viennent de Firebase) ---
   const [pins, setPins] = useState<Pin[]>([]);
+  const [loadingPins, setLoadingPins] = useState(true);
 
   // --- CARTE & NAVIGATION ---
   const [region, setRegion] = useState({ latitude: 48.8566, longitude: 2.3522, latitudeDelta: 0.0922, longitudeDelta: 0.0421 });
@@ -58,18 +72,59 @@ export default function App() {
   const [rating, setRating] = useState(0);
   const [date, setDate] = useState(new Date());
   const [showDatePicker, setShowDatePicker] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
   // --- CONSULTATION ---
   const [selectedPin, setSelectedPin] = useState<Pin | null>(null);
   const [calendarVisible, setCalendarVisible] = useState(false);
   const [pinsDuJour, setPinsDuJour] = useState<Pin[]>([]);
-  const [pinsDuJourModalVisible, setPinsDuJourModalVisible] = useState(false);
   
-  // 🔑 MODIFICATION DES ÉTATS PARTENAIRES :
-  const [partnersList, setPartnersList] = useState<string[]>(['Solo']); // Liste de tous les partenaires uniques
-  const [currentPartners, setCurrentPartners] = useState<string[]>(['Solo']); // Doit être un tableau pour le pin en cours
+  // --- PARTENAIRES ---
+  // Note: partnersList global est difficile à gérer en temps réel simple, 
+  // on garde currentPartners pour l'ajout local
+  const [partnersList, setPartnersList] = useState<string[]>(['Solo']); 
+  const [currentPartners, setCurrentPartners] = useState<string[]>(['Solo']);
  
-  // --- FONCTIONS ---
+  // =========================================================
+  // 2. USE-EFFECTS (CONNECTIVITÉ)
+  // =========================================================
+
+  // A. Écouter l'état de connexion (Login/Logout)
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setAuthLoading(false);
+    });
+    return unsubscribe;
+  }, []);
+
+  // B. Écouter la base de données (Temps Réel)
+  useEffect(() => {
+    if (!user) {
+        setPins([]); // On vide si déconnecté
+        return;
+    }
+
+    // On récupère tous les pins triés par date
+    const q = query(collection(db, "pins"), orderBy("dateISO", "desc"));
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedPins: any[] = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setPins(fetchedPins);
+      setLoadingPins(false);
+    });
+
+    return unsubscribe;
+  }, [user]);
+
+  // =========================================================
+  // 3. FONCTIONS
+  // =========================================================
+
+  const handleLogout = () => signOut(auth);
 
   const handleSearchAddress = async () => {
     if (searchAddress.length === 0) return;
@@ -89,16 +144,17 @@ export default function App() {
 
   const markedDates = useMemo(() => {
     let marks: any = {};
-
-    const allPins = pins || []
-
+    const allPins = pins || [];
     allPins.forEach(pin => {
       if(pin.dateISO) {
         const dateString = pin.dateISO;
         if (!marks[dateString]) {
           marks[dateString] = { dots: [] };
         }
-        marks[dateString].dots.push({key: pin.id,color: 'tomato'});
+        // On limite les points pour éviter de surcharger le calendrier visuellement
+        if(marks[dateString].dots.length < 3) {
+            marks[dateString].dots.push({key: pin.id, color: 'tomato'});
+        }
       }
     });
     return marks;
@@ -109,14 +165,11 @@ export default function App() {
     if (foundPins.length === 1) {
       setCalendarVisible(false);
       setTimeout(() => setSelectedPin(foundPins[0]), 500);
-    
     } else if (foundPins.length > 1) {
-
       setCalendarVisible(false);
       setTimeout(() => setPinsDuJour(foundPins), 500);
     }
   };
-
 
   const startAddingPin = () => { setIsSelecting(true); setSearchAddress(''); setSelectedPin(null); };
 
@@ -128,42 +181,67 @@ export default function App() {
     setModalVisible(true);
   };
 
-  // SAUVEGARDE LOCALE
-  const savePin = () => {
-    if (!title) return;
+  // --- SAUVEGARDE VERS FIREBASE ---
+  const savePin = async () => {
+    if (!title || title.trim() === "") {
+        Alert.alert("Titre manquant", "Veuillez donner un nom à ce lieu.");
+        return;
+    }
     
+    setIsSaving(true);
     const isoDate = date.toISOString().split('T')[0];
 
-    // 1. Mettre à jour la liste des partenaires uniques (partnersList)
-    currentPartners.forEach(partner => {
-        if (partner && partner !== 'Solo' && !partnersList.includes(partner)) {
-            setPartnersList(prevList => [...prevList, partner]);
-        }
-    });
-    
-    const newPin = {
-      id: Date.now().toString(), // ID simple basé sur l'heure
-      coordinate: tempCoordinate,
-      title: title,
-      description: description,
-      rating: rating,
-      dateISO: isoDate,
-      dateReadable: date.toLocaleDateString(),
-      partners: currentPartners
-    };
-
-    setPins([...(pins || []), newPin]); // On ajoute au tableau local
-    setModalVisible(false);
-    setCurrentPartners(['Solo']);
+    try {
+        await addDoc(collection(db, "pins"), {
+            coordinate: tempCoordinate,
+            title: title,
+            description: description,
+            rating: rating,
+            dateISO: isoDate,
+            dateReadable: date.toLocaleDateString(),
+            partners: currentPartners, // On sauvegarde les partenaires
+            userId: user.uid,          // On sauvegarde l'auteur
+            userEmail: user.email,
+            createdAt: new Date().toISOString()
+        });
+        
+        // On ferme le modal (pas besoin de setPins, onSnapshot le fera)
+        setModalVisible(false);
+        setCurrentPartners(['Solo']);
+    } catch (e) {
+        Alert.alert("Erreur", "Impossible de sauvegarder en ligne.");
+        console.error(e);
+    } finally {
+        setIsSaving(false);
+    }
   };
 
-  // --- RENDER ---
+  // =========================================================
+  // 4. RENDU CONDITIONNEL (LOGIN)
+  // =========================================================
+
+  if (authLoading) {
+      return <View style={{flex:1, justifyContent:'center'}}><ActivityIndicator size="large" color="#2196F3"/></View>;
+  }
+
+  if (!user) {
+      return <AuthScreen />;
+  }
+
+  // =========================================================
+  // 5. RENDU PRINCIPAL
+  // =========================================================
+
   const renderMapScreen = () => (
     <View style={{ flex: 1 }}>
       {!isSelecting && (
         <View style={styles.topHeader}>
             <TouchableOpacity style={styles.calendarIcon} onPress={() => setCalendarVisible(true)}>
                 <Ionicons name="calendar" size={24} color="#2196F3" />
+            </TouchableOpacity>
+            {/* Bouton Logout */}
+            <TouchableOpacity style={[styles.calendarIcon, {marginTop:10}]} onPress={handleLogout}>
+                <Ionicons name="log-out-outline" size={24} color="#ff5252" />
             </TouchableOpacity>
         </View>
       )}
@@ -196,8 +274,9 @@ export default function App() {
 
   const renderHistoryScreen = () => (
     <View style={styles.historyContainer}>
-      <Text style={styles.pageTitle}>Mon Historique 📜</Text>
-      <FlatList<Pin>
+      <Text style={styles.pageTitle}>Historique Global 📜</Text>
+      {loadingPins ? <ActivityIndicator size="large" /> : (
+        <FlatList<Pin>
           data={pins}
           keyExtractor={(item) => item.id}
           renderItem={({ item }: { item: Pin}) => (
@@ -206,10 +285,12 @@ export default function App() {
                 <Text style={styles.historyTitle}>{item.title}</Text>
                 <Text style={styles.historyDate}>{item.dateReadable}</Text>
               </View>
+              {item.userEmail && <Text style={{fontSize:10, color:'#999', marginBottom:5}}>Par : {item.userEmail}</Text>}
               <StarRating rating={item.rating} isInteractive={false} />
             </TouchableOpacity>
           )}
         />
+      )}
     </View>
   );
 
@@ -255,8 +336,8 @@ export default function App() {
                           <TouchableOpacity 
                               style={styles.historyCard} 
                               onPress={() => {
-                                  setPinsDuJour([]); // Ferme la liste
-                                  setSelectedPin(item); // Affiche le pin sélectionné
+                                  setPinsDuJour([]); 
+                                  setSelectedPin(item);
                               }}
                           >
                               <View style={styles.historyHeader}>
@@ -275,7 +356,9 @@ export default function App() {
                   </TouchableOpacity>
               </View>
           </View>
-      </Modal><AddPinModal 
+      </Modal>
+
+      <AddPinModal 
         visible={modalVisible}
         onClose={() => setModalVisible(false)}
         onSave={savePin}
@@ -284,9 +367,10 @@ export default function App() {
         rating={rating} setRating={setRating}
         date={date} setDate={setDate}
         showDatePicker={showDatePicker} setShowDatePicker={setShowDatePicker}
-        partnersList={partnersList}
+        // Pour les partenaires
         currentPartners={currentPartners}
         setCurrentPartners={setCurrentPartners}
+        isSaving={isSaving}
       />
 
       <Modal visible={selectedPin !== null} animationType="fade" transparent={true}>
@@ -299,6 +383,8 @@ export default function App() {
                 </View>
                 <Text style={styles.modalTitle}>{selectedPin.title}</Text>
                 <Text style={styles.dateBadge}>{selectedPin.dateReadable}</Text>
+                {/* Affichage de l'auteur et des partenaires */}
+                {selectedPin.userEmail && <Text style={{fontSize:12, color:'#666', fontStyle:'italic', marginBottom:5}}>Posté par : {selectedPin.userEmail}</Text>}
                 <Text style={styles.sectionTitle}>
                     Partenaire(s) :
                     <Text style={{fontWeight: 'normal', color: '#555', marginLeft: 5}}>
